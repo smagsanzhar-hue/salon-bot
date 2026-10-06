@@ -11,7 +11,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from dotenv import load_dotenv
 
-from assistant import Assistant
+from assistant import Assistant, BookingStore
 from backends import make_backend
 from salon import SALON
 
@@ -35,7 +35,7 @@ async def notify_owner(text: str):
     await bot.send_message(OWNER_CHAT_ID, text)
 
 
-assistant = Assistant(backend, notify_owner)
+assistant = Assistant(backend, notify_owner, BookingStore(os.getenv("BOOKINGS_FILE", "bookings.json")))
 locks: dict[int, asyncio.Lock] = {}
 
 
