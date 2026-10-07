@@ -28,6 +28,7 @@ backend = make_backend(
     gemini_key=os.getenv("GEMINI_API_KEY", ""),
     claude_key=os.getenv("ANTHROPIC_API_KEY", ""),
     model=os.getenv("MODEL", ""),
+    fallback_models=os.getenv("FALLBACK_MODELS", ""),
 )
 
 bot = Bot(BOT_TOKEN)
@@ -70,15 +71,15 @@ async def chat(message: Message):
                     assistant.reply(uid, message.text, message.from_user.username or ""),
                     timeout=AI_TIMEOUT,
                 )
+            # История разговора при сбое сохраняется (её восстанавливает backend), поэтому не сбрасываем её
             except asyncio.TimeoutError:
                 logging.warning("AI timeout after %ss for user %s", AI_TIMEOUT, uid)
-                assistant.reset(uid)
-                answer = ("Извините, отвечаю дольше обычного 🙏 Напишите, пожалуйста, ещё раз "
-                          f"или позвоните нам: {SALON['phone']}")
+                answer = ("Извините, сейчас отвечаю медленнее обычного 🙏 Повторите, пожалуйста, "
+                          f"последнее сообщение через минуту или позвоните нам: {SALON['phone']}")
             except Exception:
                 logging.exception("AI error")
-                assistant.reset(uid)
-                answer = f"Извините, небольшая техническая заминка. Позвоните нам: {SALON['phone']}"
+                answer = ("Извините, небольшая техническая заминка 🙏 Повторите, пожалуйста, "
+                          f"последнее сообщение через минуту или позвоните нам: {SALON['phone']}")
         logging.info("reply to %s in %.1fs", uid, time.monotonic() - started)
         await message.answer(answer)
 

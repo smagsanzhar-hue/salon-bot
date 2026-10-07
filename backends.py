@@ -3,18 +3,25 @@
 - gemini — бесплатный лимит Google, для демо и первых тестов
 - claude — платный (Anthropic), для клиентов, когда бот должен работать стабильно
 """
+import logging
+
 from assistant import BOOKING_NAME, BOOKING_DESCRIPTION, BOOKING_SCHEMA, MAX_HISTORY
 
 MAX_ROUNDS = 3  # ответ -> запись -> ответ
 
 
 class GeminiBackend:
-    def __init__(self, api_key: str, model: str, client=None):
+    def __init__(self, api_key: str, model: str, client=None, fallback_models=()):
         from google import genai
-        from google.genai import types
-        self.types = types
-        self.client = client or genai.Client(api_key=api_key)
-        self.model = model
+        from google.genai import errors, types
+        self.types, self.errors = types, errors
+        # Не больше 2 коротких попыток на модель, чтобы клиент не ждал по 30 секунд
+        self.client = client or genai.Client(api_key=api_key, http_options=types.HttpOptions(
+            timeout=20_000,
+            retry_options=types.HttpRetryOptions(attempts=2, initial_delay=1, max_delay=3),
+        ))
+        # Основная модель + запасные: если одна перегружена (503) или упёрлась в лимит (429), пробуем следующую
+        self.models = [model, *[m for m in fallback_models if m and m != model]]
         self.history: dict[int, list] = {}
         self.tool = types.Tool(function_declarations=[types.FunctionDeclaration(
             name=BOOKING_NAME, description=BOOKING_DESCRIPTION,
@@ -24,9 +31,33 @@ class GeminiBackend:
     def reset(self, user_id: int):
         self.history.pop(user_id, None)
 
+    async def _generate(self, contents, config):
+        last_error = None
+        for model in self.models:
+            try:
+                return await self.client.aio.models.generate_content(
+                    model=model, contents=contents, config=config)
+            except self.errors.ServerError as err:              # 5xx: перегрузка у Google
+                last_error = err
+            except self.errors.ClientError as err:              # 429: лимит; остальные 4xx — сразу ошибка
+                if getattr(err, "code", None) != 429:
+                    raise
+                last_error = err
+            logging.warning("Gemini %s недоступна (%s), пробую следующую модель", model, last_error)
+        raise last_error
+
     async def reply(self, user_id, text, system, on_booking) -> str:
-        t = self.types
         msgs = self.history.setdefault(user_id, [])
+        start = len(msgs)
+        try:
+            return await self._reply(user_id, msgs, text, system, on_booking)
+        except BaseException:
+            # Сбой или таймаут: убираем только неудавшееся сообщение, остальной разговор сохраняем
+            del msgs[start:]
+            raise
+
+    async def _reply(self, user_id, msgs, text, system, on_booking) -> str:
+        t = self.types
         msgs.append(t.Content(role="user", parts=[t.Part.from_text(text=text)]))
         config = t.GenerateContentConfig(
             system_instruction=system,
@@ -35,8 +66,7 @@ class GeminiBackend:
         )
         answer = ""
         for _ in range(MAX_ROUNDS):
-            resp = await self.client.aio.models.generate_content(
-                model=self.model, contents=list(msgs), config=config)
+            resp = await self._generate(list(msgs), config)
             if not resp.candidates or not resp.candidates[0].content:
                 break
             content = resp.candidates[0].content
@@ -81,6 +111,14 @@ class ClaudeBackend:
 
     async def reply(self, user_id, text, system, on_booking) -> str:
         msgs = self.history.setdefault(user_id, [])
+        start = len(msgs)
+        try:
+            return await self._reply(user_id, msgs, text, system, on_booking)
+        except BaseException:
+            del msgs[start:]  # сохраняем разговор, убираем только неудавшееся сообщение
+            raise
+
+    async def _reply(self, user_id, msgs, text, system, on_booking) -> str:
         msgs.append({"role": "user", "content": text})
         answer = ""
         for _ in range(MAX_ROUNDS):
@@ -115,10 +153,15 @@ def _claude_param(block) -> dict:
     return {"type": "text", "text": block.text}
 
 
-def make_backend(provider: str, gemini_key: str = "", claude_key: str = "", model: str = ""):
+DEFAULT_GEMINI_FALLBACKS = "gemini-3.1-flash-lite,gemini-3.5-flash"
+
+
+def make_backend(provider: str, gemini_key: str = "", claude_key: str = "", model: str = "",
+                 fallback_models: str = ""):
     provider = (provider or "gemini").lower()
     if provider == "gemini":
-        return GeminiBackend(gemini_key, model or "gemini-3.5-flash-lite")
+        fallbacks = [m.strip() for m in (fallback_models or DEFAULT_GEMINI_FALLBACKS).split(",")]
+        return GeminiBackend(gemini_key, model or "gemini-3.5-flash-lite", fallback_models=fallbacks)
     if provider == "claude":
         return ClaudeBackend(claude_key, model or "claude-haiku-4-5-20251001")
     raise ValueError(f"Неизвестный PROVIDER: {provider} (нужно gemini или claude)")
